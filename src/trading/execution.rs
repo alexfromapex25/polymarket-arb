@@ -1,16 +1,17 @@
 //! Order execution and verification.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 use tracing::{debug, error, info, instrument, warn};
 
-use super::order::{OrderParams, OrderState, OrderStatus, Side, TimeInForce};
 use crate::error::TradingError;
 use crate::market::PolymarketClient;
 use crate::signing;
+
+use super::order::{OrderParams, OrderState, OrderStatus, Side, TimeInForce};
 
 /// Order submission request body.
 #[derive(Debug, Clone, Serialize)]
@@ -145,7 +146,7 @@ pub async fn submit_order(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = response.text().await.unwrap_or_else(|_| "<body unavailable>".to_string());
         return Err(TradingError::SubmissionFailed(format!(
             "Order submission failed: HTTP {} - {}",
             status, body
@@ -222,7 +223,7 @@ pub async fn wait_for_terminal_order(
     timeout: Duration,
     poll_interval: Duration,
 ) -> OrderState {
-    let start = std::time::Instant::now();
+    let start = Instant::now();
 
     loop {
         if start.elapsed() >= timeout {
@@ -424,7 +425,10 @@ pub async fn cancel_all_orders(client: &PolymarketClient) -> Result<u32, Trading
     }
 
     // Try to parse response to get count
-    let json: serde_json::Value = response.json().await.unwrap_or_default();
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .unwrap_or_else(|_| serde_json::Value::Null);
     let count = json
         .get("canceled")
         .and_then(|v| v.as_array())
@@ -508,9 +512,6 @@ mod tests {
             parse_decimal_field(&json, &["remaining"]),
             Some(Decimal::new(525, 2))
         );
-        assert_eq!(
-            parse_decimal_field(&json, &["missing"]),
-            None
-        );
+        assert_eq!(parse_decimal_field(&json, &["missing"]), None);
     }
 }

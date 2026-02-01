@@ -214,7 +214,7 @@ mod tests {
         let key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let result = address_from_private_key(key);
         assert!(result.is_ok());
-        let addr = result.unwrap();
+        let addr = result.expect("address derivation should succeed for valid key");
         assert!(addr.starts_with("0x"));
     }
 }

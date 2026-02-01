@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
@@ -15,8 +15,8 @@ use polymarket_arb::arbitrage::{check_arbitrage, ArbitrageExecutor};
 use polymarket_arb::config::Config;
 use polymarket_arb::market::{discover_active_market, PolymarketClient};
 use polymarket_arb::metrics;
-use polymarket_arb::orderbook::websocket::{MarketWebSocket, ReconnectConfig};
 use polymarket_arb::orderbook::types::OutcomeBook;
+use polymarket_arb::orderbook::websocket::{MarketWebSocket, ReconnectConfig};
 use polymarket_arb::signing::address_from_private_key;
 use polymarket_arb::utils::shutdown_signal;
 
@@ -84,7 +84,8 @@ async fn main() -> anyhow::Result<()> {
     let filter = if args.verbose {
         EnvFilter::new("polymarket_arb=debug,info")
     } else {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+        EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("info"))
     };
 
     tracing_subscriber::registry()
@@ -268,7 +269,7 @@ async fn cmd_discover_market() -> anyhow::Result<()> {
     println!("======================================================================");
 
     let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(Duration::from_secs(30))
         .build()?;
 
     println!("\nSearching for active BTC 15min market...\n");
@@ -369,7 +370,7 @@ async fn cmd_run(dry_run_override: Option<bool>, port: u16) -> anyhow::Result<()
             Err(e) => {
                 warn!("No active market found: {}. Retrying in 30s...", e);
                 app_state.set_ready(false);
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
                 continue;
             }
         };
@@ -399,7 +400,7 @@ async fn cmd_run(dry_run_override: Option<bool>, port: u16) -> anyhow::Result<()
                 Ok(book) => book,
                 Err(e) => {
                     warn!("Failed to fetch UP order book: {}", e);
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
             };
@@ -408,7 +409,7 @@ async fn cmd_run(dry_run_override: Option<bool>, port: u16) -> anyhow::Result<()
                 Ok(book) => book,
                 Err(e) => {
                     warn!("Failed to fetch DOWN order book: {}", e);
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
             };
@@ -451,7 +452,7 @@ async fn cmd_run(dry_run_override: Option<bool>, port: u16) -> anyhow::Result<()
             }
 
             // Brief pause between scans (configurable, 0 for continuous)
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
         // Market closed
@@ -482,7 +483,7 @@ async fn cmd_run(dry_run_override: Option<bool>, port: u16) -> anyhow::Result<()
 
         // Brief pause before searching for next market
         info!("Searching for next market in 10s...");
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
     }
 }
 
@@ -556,7 +557,7 @@ async fn cmd_run_websocket(dry_run_override: Option<bool>, port: u16) -> anyhow:
             Err(e) => {
                 warn!("No active market found: {}. Retrying in 30s...", e);
                 app_state.set_ready(false);
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
                 continue;
             }
         };
@@ -651,7 +652,7 @@ async fn cmd_run_websocket(dry_run_override: Option<bool>, port: u16) -> anyhow:
                         }
                     }
                 }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {
                     // Periodic check if market is still open
                     if market.is_closed() {
                         break;
@@ -679,7 +680,7 @@ async fn cmd_run_websocket(dry_run_override: Option<bool>, port: u16) -> anyhow:
 
         info!("========================================");
         info!("Searching for next market in 10s...");
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
     }
 }
 
@@ -694,7 +695,7 @@ async fn cmd_ws_test() -> anyhow::Result<()> {
 
     // First discover a market to get token IDs
     let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(Duration::from_secs(30))
         .build()?;
 
     println!("\n1. Discovering active market...");
@@ -719,7 +720,7 @@ async fn cmd_ws_test() -> anyhow::Result<()> {
     let start = Instant::now();
     let mut message_count = 0u32;
 
-    while start.elapsed() < std::time::Duration::from_secs(10) {
+    while start.elapsed() < Duration::from_secs(10) {
         tokio::select! {
             Some(update) = stream.next() => {
                 message_count += 1;
@@ -739,7 +740,7 @@ async fn cmd_ws_test() -> anyhow::Result<()> {
                     }
                 }
             }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
         }
     }
 

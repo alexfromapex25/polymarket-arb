@@ -163,13 +163,13 @@ pub struct WsEvent {
     pub hash: Option<String>,
 }
 
-/// WebSocket subscription message.
+/// WebSocket subscription message for Polymarket market data.
 #[derive(Debug, Serialize)]
 struct SubscribeMessage {
-    /// Message type.
+    /// Message type (e.g., "MARKET" for market data subscription).
     #[serde(rename = "type")]
     msg_type: String,
-    /// Asset IDs to subscribe to.
+    /// Asset IDs (token IDs) to subscribe to.
     assets_ids: Vec<String>,
 }
 

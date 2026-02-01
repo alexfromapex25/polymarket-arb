@@ -1,5 +1,7 @@
 //! Polymarket API client wrapper.
 
+use std::time::Duration;
+
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument, warn};
@@ -84,19 +86,19 @@ impl PolymarketClient {
     pub fn new(config: &Config) -> Self {
         let http = reqwest::Client::builder()
             // Configurable timeout (default 2s, down from 30s)
-            .timeout(std::time::Duration::from_millis(config.http_timeout_ms))
+            .timeout(Duration::from_millis(config.http_timeout_ms))
             // Fast connection establishment
-            .connect_timeout(std::time::Duration::from_millis(500))
+            .connect_timeout(Duration::from_millis(500))
             // TCP_NODELAY for low-latency (disable Nagle's algorithm)
             .tcp_nodelay(true)
             // Keep connections alive for reuse
-            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .tcp_keepalive(Duration::from_secs(30))
             // Connection pool per host (default 10)
             .pool_max_idle_per_host(config.http_pool_size)
             // Keep idle connections for 90 seconds
-            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .pool_idle_timeout(Duration::from_secs(90))
             .build()
-            .expect("failed to create HTTP client");
+            .expect("reqwest client builder should not fail with valid configuration");
 
         Self {
             http,
@@ -211,7 +213,7 @@ impl PolymarketClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = response.text().await.unwrap_or_else(|_| "<body unavailable>".to_string());
             return Err(TradingError::SubmissionFailed(format!(
                 "Balance request failed: HTTP {} - {}",
                 status, body
@@ -362,7 +364,7 @@ mod tests {
         let client = PolymarketClient::new(&config);
         let address = client.get_address();
         assert!(address.is_ok());
-        let addr = address.unwrap();
+        let addr = address.expect("address derivation should succeed for valid key");
         assert!(addr.starts_with("0x"));
         assert_eq!(addr.len(), 42); // 0x + 40 hex chars
     }
