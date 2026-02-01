@@ -80,10 +80,21 @@ pub struct AssetInfo {
 }
 
 impl PolymarketClient {
-    /// Create a new Polymarket client from config.
+    /// Create a new Polymarket client from config with optimized HTTP settings.
     pub fn new(config: &Config) -> Self {
         let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            // Configurable timeout (default 2s, down from 30s)
+            .timeout(std::time::Duration::from_millis(config.http_timeout_ms))
+            // Fast connection establishment
+            .connect_timeout(std::time::Duration::from_millis(500))
+            // TCP_NODELAY for low-latency (disable Nagle's algorithm)
+            .tcp_nodelay(true)
+            // Keep connections alive for reuse
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            // Connection pool per host (default 10)
+            .pool_max_idle_per_host(config.http_pool_size)
+            // Keep idle connections for 90 seconds
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
             .build()
             .expect("failed to create HTTP client");
 
@@ -326,6 +337,14 @@ mod tests {
             port: 8080,
             rust_log: "info".to_string(),
             verbose: false,
+            http_timeout_ms: 2000,
+            http_pool_size: 10,
+            order_timeout_ms: 500,
+            order_poll_interval_ms: 50,
+            ws_reconnect_max_delay_s: 30,
+            ws_heartbeat_interval_s: 30,
+            metrics_enabled: true,
+            metrics_port: 9090,
         }
     }
 

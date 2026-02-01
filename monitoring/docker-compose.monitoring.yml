@@ -1,0 +1,77 @@
+version: '3.8'
+
+# Docker Compose configuration for Polymarket Arbitrage Bot monitoring stack
+# Usage: docker-compose -f monitoring/docker-compose.monitoring.yml up -d
+#
+# Access:
+#   - Prometheus: http://localhost:9091
+#   - Grafana: http://localhost:3000 (admin/admin)
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: polymarket-prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts:/etc/prometheus/alerts:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+      - '--storage.tsdb.retention.size=5GB'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    ports:
+      - "9091:9090"
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - monitoring
+
+  grafana:
+    image: grafana/grafana:10.1.0
+    container_name: polymarket-grafana
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana-dashboard.json:/var/lib/grafana/dashboards/polymarket-arb.json:ro
+      - ./grafana-provisioning:/etc/grafana/provisioning:ro
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/polymarket-arb.json
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    networks:
+      - monitoring
+
+  # Optional: Alertmanager for alert routing
+  # alertmanager:
+  #   image: prom/alertmanager:v0.26.0
+  #   container_name: polymarket-alertmanager
+  #   volumes:
+  #     - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+  #     - alertmanager_data:/alertmanager
+  #   command:
+  #     - '--config.file=/etc/alertmanager/alertmanager.yml'
+  #     - '--storage.path=/alertmanager'
+  #   ports:
+  #     - "9093:9093"
+  #   restart: unless-stopped
+  #   networks:
+  #     - monitoring
+
+volumes:
+  prometheus_data:
+  grafana_data:
+  # alertmanager_data:
+
+networks:
+  monitoring:
+    driver: bridge

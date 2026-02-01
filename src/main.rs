@@ -1,8 +1,11 @@
 //! BTC 15-minute Polymarket arbitrage bot entry point.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Instant;
 
 use clap::{Parser, Subcommand};
+use futures::StreamExt;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -11,6 +14,9 @@ use polymarket_arb::api::{create_router, AppState};
 use polymarket_arb::arbitrage::{check_arbitrage, ArbitrageExecutor};
 use polymarket_arb::config::Config;
 use polymarket_arb::market::{discover_active_market, PolymarketClient};
+use polymarket_arb::metrics;
+use polymarket_arb::orderbook::websocket::{MarketWebSocket, ReconnectConfig};
+use polymarket_arb::orderbook::types::OutcomeBook;
 use polymarket_arb::signing::address_from_private_key;
 use polymarket_arb::utils::shutdown_signal;
 
@@ -47,6 +53,10 @@ enum Command {
         /// HTTP server port for health/metrics.
         #[arg(short, long, default_value = "8080")]
         port: u16,
+
+        /// Use WebSocket for market data (lower latency).
+        #[arg(long)]
+        websocket: bool,
     },
 
     /// Check configuration validity.
@@ -57,6 +67,12 @@ enum Command {
 
     /// Discover the current active BTC 15min market.
     DiscoverMarket,
+
+    /// Test WebSocket connection (diagnostic).
+    WsTest,
+
+    /// Run latency benchmark.
+    Benchmark,
 }
 
 #[tokio::main]
@@ -76,12 +92,23 @@ async fn main() -> anyhow::Result<()> {
         .with(filter)
         .init();
 
+    // Initialize metrics
+    metrics::init_metrics();
+
     // Handle subcommands
     match args.command {
         Some(Command::CheckConfig) => cmd_check_config().await,
         Some(Command::CheckBalance) => cmd_check_balance().await,
         Some(Command::DiscoverMarket) => cmd_discover_market().await,
-        Some(Command::Run { dry_run, port }) => cmd_run(dry_run, port).await,
+        Some(Command::Run { dry_run, port, websocket }) => {
+            if websocket {
+                cmd_run_websocket(dry_run, port).await
+            } else {
+                cmd_run(dry_run, port).await
+            }
+        }
+        Some(Command::WsTest) => cmd_ws_test().await,
+        Some(Command::Benchmark) => cmd_benchmark().await,
         None => cmd_run(args.dry_run, args.port).await,
     }
 }
@@ -457,4 +484,336 @@ async fn cmd_run(dry_run_override: Option<bool>, port: u16) -> anyhow::Result<()
         info!("Searching for next market in 10s...");
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
     }
+}
+
+/// Run the bot with WebSocket-driven execution (lower latency).
+async fn cmd_run_websocket(dry_run_override: Option<bool>, port: u16) -> anyhow::Result<()> {
+    // Load configuration
+    info!("Loading configuration...");
+    let mut config = Config::load().map_err(|e| {
+        error!("Failed to load configuration: {}", e);
+        e
+    })?;
+
+    // Override with CLI args if provided
+    if let Some(dry_run) = dry_run_override {
+        config.dry_run = dry_run;
+    }
+
+    // Validate configuration
+    if let Err(e) = config.validate() {
+        error!("Invalid configuration: {}", e);
+        return Err(anyhow::anyhow!("Configuration validation failed: {}", e));
+    }
+
+    info!("Configuration loaded successfully");
+    info!("Mode: {} (WebSocket-driven)", if config.dry_run { "SIMULATION" } else { "LIVE TRADING" });
+    info!("Target pair cost: ${}", config.target_pair_cost);
+    info!("Order size: {} shares", config.order_size);
+
+    // Create app state
+    let app_state = AppState::new();
+
+    // Start HTTP server
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = TcpListener::bind(addr).await?;
+    info!("HTTP server listening on {}", addr);
+
+    let router = create_router(app_state.clone());
+
+    // Spawn HTTP server
+    let _server_handle = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+    });
+
+    // Create Polymarket client
+    let client = PolymarketClient::new(&config);
+    let http_client = client.http().clone();
+
+    // Create executor
+    let mut executor = ArbitrageExecutor::new(&config);
+
+    // Main bot loop
+    info!("Starting WebSocket-driven arbitrage bot...");
+
+    loop {
+        // Discover active market
+        info!("Searching for active BTC 15min market...");
+
+        let market = match discover_active_market(&http_client).await {
+            Ok(m) => {
+                info!("Found market: {}", m.slug);
+                info!("Time remaining: {}", m.time_remaining_str());
+
+                // Update app state
+                *app_state.market_slug.write().await = Some(m.slug.clone());
+                app_state.set_ready(true);
+
+                m
+            }
+            Err(e) => {
+                warn!("No active market found: {}. Retrying in 30s...", e);
+                app_state.set_ready(false);
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                continue;
+            }
+        };
+
+        info!("========================================");
+        info!("WEBSOCKET-DRIVEN ARBITRAGE BOT STARTED");
+        info!("========================================");
+        info!("Market: {}", market.slug);
+        info!("UP Token: {}", market.up_token_id);
+        info!("DOWN Token: {}", market.down_token_id);
+        info!("Mode: {}", if config.dry_run { "SIMULATION" } else { "LIVE TRADING" });
+        info!("========================================");
+
+        // Create WebSocket client with reconnection config
+        let reconnect_config = ReconnectConfig::from_config(
+            config.ws_reconnect_max_delay_s,
+            config.ws_heartbeat_interval_s,
+        );
+        let ws = Arc::new(MarketWebSocket::with_reconnect_config(
+            config.polymarket_ws_url.clone(),
+            reconnect_config,
+        ));
+
+        // Start WebSocket with auto-reconnect
+        let asset_ids = vec![
+            market.up_token_id.clone(),
+            market.down_token_id.clone(),
+        ];
+
+        let mut ws_receiver = ws.clone().run_with_reconnect(asset_ids).await;
+
+        info!("WebSocket connected, waiting for book updates...");
+
+        // Process WebSocket updates until market closes
+        while !market.is_closed() {
+            tokio::select! {
+                Some(_update) = ws_receiver.recv() => {
+                    let detection_start = Instant::now();
+
+                    // Get both books from WebSocket state
+                    let up_book = ws.get_book(&market.up_token_id);
+                    let down_book = ws.get_book(&market.down_token_id);
+
+                    if let (Some(up_state), Some(down_state)) = (up_book, down_book) {
+                        // Convert WebSocket state to OutcomeBook
+                        let (up_bids, up_asks) = up_state.to_levels();
+                        let (down_bids, down_asks) = down_state.to_levels();
+
+                        let up_outcome_book = OutcomeBook {
+                            token_id: market.up_token_id.clone(),
+                            outcome: polymarket_arb::market::Outcome::Up,
+                            bids: up_bids,
+                            asks: up_asks,
+                            updated_at: time::OffsetDateTime::now_utc(),
+                        };
+
+                        let down_outcome_book = OutcomeBook {
+                            token_id: market.down_token_id.clone(),
+                            outcome: polymarket_arb::market::Outcome::Down,
+                            bids: down_bids,
+                            asks: down_asks,
+                            updated_at: time::OffsetDateTime::now_utc(),
+                        };
+
+                        // Check for arbitrage opportunity
+                        match check_arbitrage(&market, &up_outcome_book, &down_outcome_book, &config) {
+                            Ok(Some(opportunity)) => {
+                                metrics::record_opportunity_detection_latency(detection_start);
+                                metrics::inc_opportunities_detected();
+
+                                // Execute arbitrage immediately
+                                match executor.execute(&client, &opportunity, &config).await {
+                                    Ok(result) => {
+                                        info!("Execution result: {:?}", result);
+                                        metrics::inc_opportunities_executed();
+
+                                        // Update stats in app state
+                                        let stats = executor.stats();
+                                        *app_state.stats.write().await = stats;
+                                    }
+                                    Err(e) => {
+                                        error!("Execution failed: {}", e);
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                // No opportunity - just continue listening
+                            }
+                            Err(e) => {
+                                warn!("Arbitrage check error: {}", e);
+                            }
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                    // Periodic check if market is still open
+                    if market.is_closed() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Market closed - print summary
+        info!("========================================");
+        info!("MARKET CLOSED - FINAL SUMMARY");
+        info!("========================================");
+        info!("Market: {}", market.slug);
+
+        let stats = executor.stats();
+        info!("Total opportunities detected: {}", stats.opportunities_found);
+        info!("Total trades executed: {}", stats.trades_executed);
+        info!("Total shares bought: {}", stats.total_shares_bought);
+        info!("Total invested: ${}", stats.total_invested);
+        info!("Expected profit: ${}", stats.expected_profit());
+
+        if config.dry_run {
+            info!("Sim ending balance: ${}", stats.sim_ending_balance());
+        }
+
+        info!("========================================");
+        info!("Searching for next market in 10s...");
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    }
+}
+
+/// Test WebSocket connection.
+async fn cmd_ws_test() -> anyhow::Result<()> {
+    println!("======================================================================");
+    println!("BTC 15M ARB BOT - WEBSOCKET TEST");
+    println!("======================================================================");
+
+    let config = Config::load()?;
+    config.validate().map_err(|e| anyhow::anyhow!(e))?;
+
+    // First discover a market to get token IDs
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+
+    println!("\n1. Discovering active market...");
+    let market = discover_active_market(&http_client).await?;
+    println!("   Found: {}", market.slug);
+    println!("   UP Token: {}", market.up_token_id);
+    println!("   DOWN Token: {}", market.down_token_id);
+
+    println!("\n2. Connecting to WebSocket...");
+    let ws = MarketWebSocket::new(config.polymarket_ws_url.clone());
+
+    let asset_ids = vec![
+        market.up_token_id.clone(),
+        market.down_token_id.clone(),
+    ];
+
+    let stream = ws.run(asset_ids).await?;
+    let mut stream = Box::pin(stream);
+    println!("   Connected!");
+
+    println!("\n3. Waiting for book updates (10 seconds)...");
+    let start = Instant::now();
+    let mut message_count = 0u32;
+
+    while start.elapsed() < std::time::Duration::from_secs(10) {
+        tokio::select! {
+            Some(update) = stream.next() => {
+                message_count += 1;
+                println!("   [{:.1}s] Received: {:?}", start.elapsed().as_secs_f64(), update);
+
+                // Show book state after a few messages
+                if message_count == 3 {
+                    if let Some(book) = ws.get_book(&market.up_token_id) {
+                        let (bids, asks) = book.to_levels();
+                        println!("   UP Book - Bids: {}, Asks: {}", bids.len(), asks.len());
+                        if let Some(best_bid) = bids.first() {
+                            println!("   Best Bid: ${} x {}", best_bid.price, best_bid.size);
+                        }
+                        if let Some(best_ask) = asks.first() {
+                            println!("   Best Ask: ${} x {}", best_ask.price, best_ask.size);
+                        }
+                    }
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+        }
+    }
+
+    println!("\n======================================================================");
+    println!("WEBSOCKET TEST COMPLETE");
+    println!("  Messages received: {}", message_count);
+    println!("  Connection status: {}", if ws.is_connected() { "Connected" } else { "Disconnected" });
+    println!("======================================================================");
+
+    Ok(())
+}
+
+/// Run latency benchmark.
+async fn cmd_benchmark() -> anyhow::Result<()> {
+    println!("======================================================================");
+    println!("BTC 15M ARB BOT - LATENCY BENCHMARK");
+    println!("======================================================================");
+
+    let config = Config::load()?;
+    config.validate().map_err(|e| anyhow::anyhow!(e))?;
+
+    let client = PolymarketClient::new(&config);
+
+    // Discover market
+    println!("\n1. Discovering market...");
+    let http_client = client.http().clone();
+    let market = discover_active_market(&http_client).await?;
+    println!("   Found: {}", market.slug);
+
+    // Benchmark order book fetches
+    println!("\n2. Benchmarking order book fetch latency (10 iterations)...");
+    let mut latencies = Vec::with_capacity(10);
+
+    for i in 0..10 {
+        let start = Instant::now();
+        let _ = client.get_order_book(&market.up_token_id).await;
+        let latency = start.elapsed();
+        latencies.push(latency.as_millis() as f64);
+        println!("   Iteration {}: {:.1}ms", i + 1, latency.as_millis());
+    }
+
+    latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let avg = latencies.iter().sum::<f64>() / latencies.len() as f64;
+    let p50 = latencies[latencies.len() / 2];
+    let p95 = latencies[(latencies.len() as f64 * 0.95) as usize];
+
+    println!("\n   Results:");
+    println!("   - Average: {:.1}ms", avg);
+    println!("   - P50: {:.1}ms", p50);
+    println!("   - P95: {:.1}ms", p95);
+    println!("   - Min: {:.1}ms", latencies.first().unwrap());
+    println!("   - Max: {:.1}ms", latencies.last().unwrap());
+
+    // Benchmark signing
+    println!("\n3. Benchmarking signing latency (10 iterations)...");
+    let mut sign_latencies = Vec::with_capacity(10);
+
+    for i in 0..10 {
+        let start = Instant::now();
+        let _ = polymarket_arb::signing::generate_auth_headers(
+            client.private_key(),
+            client.signature_type(),
+        ).await;
+        let latency = start.elapsed();
+        sign_latencies.push(latency.as_millis() as f64);
+        println!("   Iteration {}: {:.1}ms", i + 1, latency.as_millis());
+    }
+
+    let avg_sign = sign_latencies.iter().sum::<f64>() / sign_latencies.len() as f64;
+    println!("\n   Average signing latency: {:.1}ms", avg_sign);
+
+    println!("\n======================================================================");
+    println!("BENCHMARK COMPLETE");
+    println!("======================================================================");
+
+    Ok(())
 }

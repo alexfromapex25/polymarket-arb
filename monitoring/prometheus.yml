@@ -1,0 +1,62 @@
+# Prometheus configuration for Polymarket Arbitrage Bot
+# https://prometheus.io/docs/prometheus/latest/configuration/configuration/
+
+global:
+  # How frequently to scrape targets
+  scrape_interval: 15s
+  # How frequently to evaluate rules
+  evaluation_interval: 15s
+  # Attach these labels to any time series or alerts
+  external_labels:
+    monitor: 'polymarket-arb'
+
+# Alertmanager configuration (optional)
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets:
+#           - alertmanager:9093
+
+# Rule files for recording and alerting rules
+rule_files:
+  - "alerts/*.yml"
+
+# Scrape configurations
+scrape_configs:
+  # Scrape Prometheus itself
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9091']
+
+  # Scrape the Polymarket Arbitrage Bot
+  - job_name: 'polymarket-arb'
+    scrape_interval: 5s  # More frequent for trading metrics
+    static_configs:
+      - targets: ['host.docker.internal:9090']
+        labels:
+          app: 'polymarket-arb'
+          env: 'production'
+
+    # Relabel to add instance label
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: 'polymarket-arb-main'
+
+    # Metric relabeling (optional)
+    metric_relabel_configs:
+      # Keep only relevant metrics to reduce storage
+      - source_labels: [__name__]
+        regex: '(order_.*|ws_.*|opportunity_.*|http_.*|signing_.*|orderbook_.*)'
+        action: keep
+
+  # Node exporter for system metrics (optional)
+  # - job_name: 'node'
+  #   static_configs:
+  #     - targets: ['host.docker.internal:9100']
+
+# Storage configuration (for docker-compose deployment)
+# storage:
+#   tsdb:
+#     retention.time: 15d
+#     retention.size: 5GB

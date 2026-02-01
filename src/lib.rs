@@ -33,6 +33,7 @@ pub mod arbitrage;
 pub mod config;
 pub mod error;
 pub mod market;
+pub mod metrics;
 pub mod orderbook;
 pub mod signing;
 pub mod trading;

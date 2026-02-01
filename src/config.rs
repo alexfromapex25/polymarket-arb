@@ -91,6 +91,40 @@ pub struct Config {
     /// Enable verbose logging.
     #[serde(default)]
     pub verbose: bool,
+
+    // === Low-Latency Tuning ===
+    /// HTTP request timeout in milliseconds.
+    #[serde(default = "default_http_timeout_ms")]
+    pub http_timeout_ms: u64,
+
+    /// HTTP connection pool size per host.
+    #[serde(default = "default_http_pool_size")]
+    pub http_pool_size: usize,
+
+    /// Order status polling timeout in milliseconds.
+    #[serde(default = "default_order_timeout_ms")]
+    pub order_timeout_ms: u64,
+
+    /// Order status poll interval in milliseconds.
+    #[serde(default = "default_order_poll_interval_ms")]
+    pub order_poll_interval_ms: u64,
+
+    /// WebSocket reconnection max delay in seconds.
+    #[serde(default = "default_ws_reconnect_max_delay_s")]
+    pub ws_reconnect_max_delay_s: u64,
+
+    /// WebSocket heartbeat interval in seconds.
+    #[serde(default = "default_ws_heartbeat_interval_s")]
+    pub ws_heartbeat_interval_s: u64,
+
+    // === Metrics ===
+    /// Enable Prometheus metrics endpoint.
+    #[serde(default = "default_true")]
+    pub metrics_enabled: bool,
+
+    /// Prometheus metrics port.
+    #[serde(default = "default_metrics_port")]
+    pub metrics_port: u16,
 }
 
 fn default_target_cost() -> Decimal {
@@ -135,6 +169,34 @@ fn default_port() -> u16 {
 
 fn default_log_level() -> String {
     "info".to_string()
+}
+
+fn default_http_timeout_ms() -> u64 {
+    2000 // 2 seconds (down from 30s)
+}
+
+fn default_http_pool_size() -> usize {
+    10
+}
+
+fn default_order_timeout_ms() -> u64 {
+    500 // 500ms (down from 3000ms)
+}
+
+fn default_order_poll_interval_ms() -> u64 {
+    50 // 50ms (down from 250ms)
+}
+
+fn default_ws_reconnect_max_delay_s() -> u64 {
+    30
+}
+
+fn default_ws_heartbeat_interval_s() -> u64 {
+    30
+}
+
+fn default_metrics_port() -> u16 {
+    9090
 }
 
 impl Config {
@@ -211,6 +273,14 @@ mod tests {
             port: default_port(),
             rust_log: default_log_level(),
             verbose: false,
+            http_timeout_ms: default_http_timeout_ms(),
+            http_pool_size: default_http_pool_size(),
+            order_timeout_ms: default_order_timeout_ms(),
+            order_poll_interval_ms: default_order_poll_interval_ms(),
+            ws_reconnect_max_delay_s: default_ws_reconnect_max_delay_s(),
+            ws_heartbeat_interval_s: default_ws_heartbeat_interval_s(),
+            metrics_enabled: true,
+            metrics_port: default_metrics_port(),
         };
 
         assert!(config.validate().is_err());
@@ -239,6 +309,14 @@ mod tests {
             port: default_port(),
             rust_log: default_log_level(),
             verbose: false,
+            http_timeout_ms: default_http_timeout_ms(),
+            http_pool_size: default_http_pool_size(),
+            order_timeout_ms: default_order_timeout_ms(),
+            order_poll_interval_ms: default_order_poll_interval_ms(),
+            ws_reconnect_max_delay_s: default_ws_reconnect_max_delay_s(),
+            ws_heartbeat_interval_s: default_ws_heartbeat_interval_s(),
+            metrics_enabled: true,
+            metrics_port: default_metrics_port(),
         };
 
         assert!(config.validate().is_err());

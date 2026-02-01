@@ -1,0 +1,113 @@
+# Alert rules for Polymarket Arbitrage Bot
+# https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/
+
+groups:
+  - name: polymarket-arb-alerts
+    rules:
+      # High order submission latency
+      - alert: HighOrderLatency
+        expr: histogram_quantile(0.95, sum(rate(order_submit_latency_ms_bucket[5m])) by (le)) > 200
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High order submission latency"
+          description: "P95 order submission latency is {{ $value | printf \"%.0f\" }}ms (threshold: 200ms)"
+
+      # Very high order latency (critical)
+      - alert: CriticalOrderLatency
+        expr: histogram_quantile(0.95, sum(rate(order_submit_latency_ms_bucket[5m])) by (le)) > 500
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Critical order submission latency"
+          description: "P95 order submission latency is {{ $value | printf \"%.0f\" }}ms (threshold: 500ms)"
+
+      # Orders failing
+      - alert: OrdersFailingWarning
+        expr: rate(orders_failed_total[5m]) > 0.01
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Orders are failing"
+          description: "Order failure rate is {{ $value | printf \"%.3f\" }}/s"
+
+      # Many orders failing (critical)
+      - alert: OrdersFailingCritical
+        expr: rate(orders_failed_total[1m]) > 0.1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High order failure rate"
+          description: "Order failure rate is {{ $value | printf \"%.3f\" }}/s"
+
+      # WebSocket disconnections
+      - alert: FrequentWsReconnects
+        expr: rate(ws_reconnects_total[10m]) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Frequent WebSocket reconnections"
+          description: "WebSocket reconnect rate is {{ $value | printf \"%.3f\" }}/s"
+
+      # No opportunities detected (might indicate market issues)
+      - alert: NoOpportunities
+        expr: rate(opportunities_detected_total[30m]) == 0
+        for: 30m
+        labels:
+          severity: info
+        annotations:
+          summary: "No arbitrage opportunities detected"
+          description: "No opportunities detected in the last 30 minutes"
+
+      # High WebSocket message latency
+      - alert: HighWsLatency
+        expr: histogram_quantile(0.95, sum(rate(ws_message_latency_ms_bucket[5m])) by (le)) > 50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High WebSocket message latency"
+          description: "P95 WebSocket message latency is {{ $value | printf \"%.0f\" }}ms"
+
+      # Bot not generating metrics (down)
+      - alert: BotDown
+        expr: up{job="polymarket-arb"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Polymarket arbitrage bot is down"
+          description: "The bot is not responding to metric scrapes"
+
+  - name: polymarket-arb-recording
+    rules:
+      # Pre-compute P50 latency
+      - record: order_submit_latency_ms:p50
+        expr: histogram_quantile(0.50, sum(rate(order_submit_latency_ms_bucket[5m])) by (le))
+
+      # Pre-compute P95 latency
+      - record: order_submit_latency_ms:p95
+        expr: histogram_quantile(0.95, sum(rate(order_submit_latency_ms_bucket[5m])) by (le))
+
+      # Pre-compute P99 latency
+      - record: order_submit_latency_ms:p99
+        expr: histogram_quantile(0.99, sum(rate(order_submit_latency_ms_bucket[5m])) by (le))
+
+      # Orders per minute
+      - record: orders_submitted:rate1m
+        expr: rate(orders_submitted_total[1m]) * 60
+
+      # Opportunities per minute
+      - record: opportunities_detected:rate1m
+        expr: rate(opportunities_detected_total[1m]) * 60
+
+      # Order success rate
+      - record: orders:success_rate
+        expr: |
+          (rate(orders_filled_total[5m])) /
+          (rate(orders_submitted_total[5m]) > 0) or vector(1)

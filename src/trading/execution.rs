@@ -457,11 +457,21 @@ pub fn extract_order_id(result: &serde_json::Value) -> Option<String> {
     None
 }
 
-/// Default timeout for order operations.
-pub const DEFAULT_ORDER_TIMEOUT: Duration = Duration::from_secs(3);
+/// Default timeout for order operations (reduced from 3s to 500ms for low-latency).
+pub const DEFAULT_ORDER_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Default poll interval for order status.
-pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Default poll interval for order status (reduced from 250ms to 50ms for low-latency).
+pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Create order timeout from config.
+pub fn order_timeout_from_config(config: &crate::config::Config) -> Duration {
+    Duration::from_millis(config.order_timeout_ms)
+}
+
+/// Create poll interval from config.
+pub fn poll_interval_from_config(config: &crate::config::Config) -> Duration {
+    Duration::from_millis(config.order_poll_interval_ms)
+}
 
 #[cfg(test)]
 mod tests {

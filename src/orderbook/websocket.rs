@@ -1,16 +1,26 @@
 //! WebSocket client for Polymarket CLOB market data feed.
+//!
+//! Features:
+//! - Automatic reconnection with exponential backoff
+//! - Heartbeat/ping-pong handling
+//! - SmallVec optimization for price levels
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
 use super::types::{BookUpdate, PriceLevel, WsEventType};
 use crate::error::WsError;
+use crate::metrics;
 
 /// L2 book state maintained from WebSocket updates.
 #[derive(Debug, Clone, Default)]
@@ -163,12 +173,76 @@ struct SubscribeMessage {
     assets_ids: Vec<String>,
 }
 
+/// Reconnection configuration for WebSocket.
+#[derive(Debug, Clone)]
+pub struct ReconnectConfig {
+    /// Initial backoff delay in milliseconds.
+    pub initial_delay_ms: u64,
+    /// Maximum backoff delay in seconds.
+    pub max_delay_s: u64,
+    /// Backoff multiplier (e.g., 2.0 for exponential).
+    pub backoff_multiplier: f64,
+    /// Heartbeat interval in seconds.
+    pub heartbeat_interval_s: u64,
+}
+
+impl Default for ReconnectConfig {
+    fn default() -> Self {
+        Self {
+            initial_delay_ms: 1000,
+            max_delay_s: 30,
+            backoff_multiplier: 2.0,
+            heartbeat_interval_s: 30,
+        }
+    }
+}
+
+impl ReconnectConfig {
+    /// Create from config values.
+    pub fn from_config(max_delay_s: u64, heartbeat_interval_s: u64) -> Self {
+        Self {
+            max_delay_s,
+            heartbeat_interval_s,
+            ..Default::default()
+        }
+    }
+
+    /// Calculate next delay with exponential backoff.
+    pub fn next_delay(&self, attempt: u32) -> Duration {
+        let delay_ms = self.initial_delay_ms as f64 * self.backoff_multiplier.powi(attempt as i32);
+        let max_delay_ms = self.max_delay_s * 1000;
+        let clamped_ms = delay_ms.min(max_delay_ms as f64) as u64;
+        Duration::from_millis(clamped_ms)
+    }
+}
+
+/// WebSocket connection state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionState {
+    /// Not connected.
+    Disconnected,
+    /// Attempting to connect.
+    Connecting,
+    /// Connected and subscribed.
+    Connected,
+    /// Reconnecting after disconnect.
+    Reconnecting,
+}
+
 /// Manages WebSocket connection and L2 book state.
 pub struct MarketWebSocket {
     /// Book state per asset ID.
     books: DashMap<String, L2BookState>,
     /// WebSocket base URL.
     ws_url: String,
+    /// Reconnection configuration.
+    reconnect_config: ReconnectConfig,
+    /// Connection state (atomic for thread safety).
+    connected: Arc<AtomicBool>,
+    /// Reconnection attempt counter.
+    reconnect_attempts: Arc<AtomicU64>,
+    /// Last successful message timestamp.
+    last_message_time: Arc<std::sync::RwLock<Option<Instant>>>,
 }
 
 impl MarketWebSocket {
@@ -177,7 +251,33 @@ impl MarketWebSocket {
         Self {
             books: DashMap::new(),
             ws_url,
+            reconnect_config: ReconnectConfig::default(),
+            connected: Arc::new(AtomicBool::new(false)),
+            reconnect_attempts: Arc::new(AtomicU64::new(0)),
+            last_message_time: Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    /// Create with custom reconnection config.
+    pub fn with_reconnect_config(ws_url: String, config: ReconnectConfig) -> Self {
+        Self {
+            books: DashMap::new(),
+            ws_url,
+            reconnect_config: config,
+            connected: Arc::new(AtomicBool::new(false)),
+            reconnect_attempts: Arc::new(AtomicU64::new(0)),
+            last_message_time: Arc::new(std::sync::RwLock::new(None)),
+        }
+    }
+
+    /// Check if currently connected.
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::SeqCst)
+    }
+
+    /// Get reconnection attempt count.
+    pub fn reconnect_attempts(&self) -> u64 {
+        self.reconnect_attempts.load(Ordering::SeqCst)
     }
 
     /// Get book state for an asset.
@@ -190,6 +290,17 @@ impl MarketWebSocket {
         for id in asset_ids {
             self.books.insert(id.clone(), L2BookState::default());
         }
+    }
+
+    /// Check if connection appears stale (no messages in heartbeat interval).
+    pub fn is_stale(&self) -> bool {
+        if let Ok(time) = self.last_message_time.read() {
+            if let Some(last) = *time {
+                return last.elapsed() > Duration::from_secs(self.reconnect_config.heartbeat_interval_s * 2);
+            }
+        }
+        // No messages received yet - not stale
+        false
     }
 
     /// Run the WebSocket connection, yielding book updates.
@@ -207,6 +318,9 @@ impl MarketWebSocket {
         let (ws_stream, _) = connect_async(&url)
             .await
             .map_err(|e| WsError::ConnectionFailed(e.to_string()))?;
+
+        self.connected.store(true, Ordering::SeqCst);
+        self.reconnect_attempts.store(0, Ordering::SeqCst);
 
         let (mut write, read) = ws_stream.split();
 
@@ -226,27 +340,48 @@ impl MarketWebSocket {
 
         info!("Subscribed to {} assets", asset_ids.len());
 
-        // Process messages
+        // Process messages with metrics tracking
         let books = &self.books;
+        let connected = self.connected.clone();
+        let last_msg_time = self.last_message_time.clone();
+
         let stream = read.filter_map(move |msg| {
             let books = books;
+            let connected = connected.clone();
+            let last_msg_time = last_msg_time.clone();
+
             async move {
+                // Update last message time on any message
+                if let Ok(mut time) = last_msg_time.write() {
+                    *time = Some(Instant::now());
+                }
+
                 match msg {
                     Ok(Message::Text(text)) => {
-                        Self::process_message(books, &text)
+                        let start = Instant::now();
+                        metrics::inc_ws_messages_received();
+                        let result = Self::process_message(books, &text);
+                        metrics::record_ws_message_latency(start);
+                        result
                     }
                     Ok(Message::Ping(_)) => {
                         debug!("Received ping");
+                        // Note: tungstenite auto-responds to pings
                         None
                     }
-                    Ok(Message::Pong(_)) => None,
+                    Ok(Message::Pong(_)) => {
+                        debug!("Received pong");
+                        None
+                    }
                     Ok(Message::Close(frame)) => {
                         warn!(frame = ?frame, "WebSocket closed");
+                        connected.store(false, Ordering::SeqCst);
                         None
                     }
                     Ok(_) => None,
                     Err(e) => {
                         error!(error = %e, "WebSocket error");
+                        connected.store(false, Ordering::SeqCst);
                         None
                     }
                 }
@@ -254,6 +389,60 @@ impl MarketWebSocket {
         });
 
         Ok(stream)
+    }
+
+    /// Run with automatic reconnection on disconnect.
+    /// Returns a channel receiver that yields book updates.
+    pub async fn run_with_reconnect(
+        self: Arc<Self>,
+        asset_ids: Vec<String>,
+    ) -> mpsc::Receiver<BookUpdate> {
+        let (tx, rx) = mpsc::channel(1000);
+
+        let ws = self;
+        let assets = asset_ids;
+
+        tokio::spawn(async move {
+            let mut attempt = 0u32;
+
+            loop {
+                info!(attempt = attempt, "Attempting WebSocket connection");
+
+                match ws.run(assets.clone()).await {
+                    Ok(stream) => {
+                        attempt = 0; // Reset on successful connection
+
+                        // Pin the stream to use with .next()
+                        let mut stream = Box::pin(stream);
+
+                        while let Some(update) = stream.next().await {
+                            if tx.send(update).await.is_err() {
+                                info!("Channel closed, stopping WebSocket");
+                                return;
+                            }
+                        }
+
+                        // Stream ended - connection closed
+                        warn!("WebSocket stream ended, will reconnect");
+                    }
+                    Err(e) => {
+                        error!(error = %e, attempt = attempt, "WebSocket connection failed");
+                    }
+                }
+
+                // Calculate backoff delay
+                let delay = ws.reconnect_config.next_delay(attempt);
+                ws.reconnect_attempts.fetch_add(1, Ordering::SeqCst);
+                metrics::inc_ws_reconnects();
+
+                info!(delay_ms = delay.as_millis(), "Reconnecting after delay");
+                tokio::time::sleep(delay).await;
+
+                attempt = attempt.saturating_add(1);
+            }
+        });
+
+        rx
     }
 
     /// Process a WebSocket message.

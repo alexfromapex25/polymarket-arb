@@ -206,6 +206,14 @@ mod tests {
             port: 8080,
             rust_log: "info".to_string(),
             verbose: false,
+            http_timeout_ms: 2000,
+            http_pool_size: 10,
+            order_timeout_ms: 500,
+            order_poll_interval_ms: 50,
+            ws_reconnect_max_delay_s: 30,
+            ws_heartbeat_interval_s: 30,
+            metrics_enabled: true,
+            metrics_port: 9090,
         }
     }
 
