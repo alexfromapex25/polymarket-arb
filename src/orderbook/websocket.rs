@@ -1,0 +1,380 @@
+//! WebSocket client for Polymarket CLOB market data feed.
+
+use std::collections::HashMap;
+
+use dashmap::DashMap;
+use futures::{SinkExt, StreamExt};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tracing::{debug, error, info, warn};
+
+use super::types::{BookUpdate, PriceLevel, WsEventType};
+use crate::error::WsError;
+
+/// L2 book state maintained from WebSocket updates.
+#[derive(Debug, Clone, Default)]
+pub struct L2BookState {
+    /// Bid levels: price -> size.
+    pub bids: HashMap<Decimal, Decimal>,
+    /// Ask levels: price -> size.
+    pub asks: HashMap<Decimal, Decimal>,
+    /// Last update timestamp (milliseconds).
+    pub last_timestamp_ms: Option<i64>,
+    /// Last hash for debugging.
+    pub last_hash: Option<String>,
+}
+
+impl L2BookState {
+    /// Apply a full book snapshot.
+    pub fn apply_snapshot(&mut self, bids: Vec<WsLevel>, asks: Vec<WsLevel>) {
+        self.bids.clear();
+        self.asks.clear();
+
+        for level in bids {
+            if let (Some(price), Some(size)) = (level.price_decimal(), level.size_decimal()) {
+                if size > Decimal::ZERO {
+                    self.bids.insert(price, size);
+                }
+            }
+        }
+
+        for level in asks {
+            if let (Some(price), Some(size)) = (level.price_decimal(), level.size_decimal()) {
+                if size > Decimal::ZERO {
+                    self.asks.insert(price, size);
+                }
+            }
+        }
+    }
+
+    /// Apply a price change delta.
+    pub fn apply_delta(&mut self, change: &WsPriceChange) {
+        let price = match change.price.parse::<Decimal>() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let size = match change.size.parse::<Decimal>() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        let book = match change.side.to_uppercase().as_str() {
+            "BUY" => &mut self.bids,
+            "SELL" => &mut self.asks,
+            _ => return,
+        };
+
+        if size <= Decimal::ZERO {
+            book.remove(&price);
+        } else {
+            book.insert(price, size);
+        }
+
+        if let Some(hash) = &change.hash {
+            self.last_hash = Some(hash.clone());
+        }
+    }
+
+    /// Convert to sorted price level vectors.
+    pub fn to_levels(&self) -> (Vec<PriceLevel>, Vec<PriceLevel>) {
+        let mut bids: Vec<PriceLevel> = self
+            .bids
+            .iter()
+            .filter(|(_, &size)| size > Decimal::ZERO)
+            .map(|(&price, &size)| PriceLevel { price, size })
+            .collect();
+        bids.sort_by(|a, b| b.price.cmp(&a.price)); // Descending
+
+        let mut asks: Vec<PriceLevel> = self
+            .asks
+            .iter()
+            .filter(|(_, &size)| size > Decimal::ZERO)
+            .map(|(&price, &size)| PriceLevel { price, size })
+            .collect();
+        asks.sort_by(|a, b| a.price.cmp(&b.price)); // Ascending
+
+        (bids, asks)
+    }
+}
+
+/// Price level from WebSocket.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WsLevel {
+    /// Price as string.
+    pub price: String,
+    /// Size as string.
+    pub size: String,
+}
+
+impl WsLevel {
+    /// Parse price to Decimal.
+    pub fn price_decimal(&self) -> Option<Decimal> {
+        self.price.parse().ok()
+    }
+
+    /// Parse size to Decimal.
+    pub fn size_decimal(&self) -> Option<Decimal> {
+        self.size.parse().ok()
+    }
+}
+
+/// Price change from WebSocket.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WsPriceChange {
+    /// Asset ID.
+    pub asset_id: Option<String>,
+    /// Price as string.
+    pub price: String,
+    /// Size as string.
+    pub size: String,
+    /// Side: "BUY" or "SELL".
+    pub side: String,
+    /// Optional hash.
+    pub hash: Option<String>,
+}
+
+/// WebSocket event from Polymarket.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WsEvent {
+    /// Event type: "book" or "price_change".
+    pub event_type: Option<String>,
+    /// Asset ID (for book events).
+    pub asset_id: Option<String>,
+    /// Bid levels (for book events).
+    pub bids: Option<Vec<WsLevel>>,
+    /// Ask levels (for book events).
+    pub asks: Option<Vec<WsLevel>>,
+    /// Price changes (for price_change events).
+    pub price_changes: Option<Vec<WsPriceChange>>,
+    /// Timestamp in milliseconds.
+    pub timestamp: Option<i64>,
+    /// Hash for debugging.
+    pub hash: Option<String>,
+}
+
+/// WebSocket subscription message.
+#[derive(Debug, Serialize)]
+struct SubscribeMessage {
+    /// Message type.
+    #[serde(rename = "type")]
+    msg_type: String,
+    /// Asset IDs to subscribe to.
+    assets_ids: Vec<String>,
+}
+
+/// Manages WebSocket connection and L2 book state.
+pub struct MarketWebSocket {
+    /// Book state per asset ID.
+    books: DashMap<String, L2BookState>,
+    /// WebSocket base URL.
+    ws_url: String,
+}
+
+impl MarketWebSocket {
+    /// Create a new WebSocket client.
+    pub fn new(ws_url: String) -> Self {
+        Self {
+            books: DashMap::new(),
+            ws_url,
+        }
+    }
+
+    /// Get book state for an asset.
+    pub fn get_book(&self, asset_id: &str) -> Option<L2BookState> {
+        self.books.get(asset_id).map(|b| b.clone())
+    }
+
+    /// Initialize books for asset IDs.
+    pub fn init_books(&self, asset_ids: &[String]) {
+        for id in asset_ids {
+            self.books.insert(id.clone(), L2BookState::default());
+        }
+    }
+
+    /// Run the WebSocket connection, yielding book updates.
+    pub async fn run(
+        &self,
+        asset_ids: Vec<String>,
+    ) -> Result<impl futures::Stream<Item = BookUpdate> + '_, WsError> {
+        let url = format!("{}/ws/market", self.ws_url.trim_end_matches('/'));
+
+        // Initialize books
+        self.init_books(&asset_ids);
+
+        info!(url = %url, assets = ?asset_ids, "Connecting to WebSocket");
+
+        let (ws_stream, _) = connect_async(&url)
+            .await
+            .map_err(|e| WsError::ConnectionFailed(e.to_string()))?;
+
+        let (mut write, read) = ws_stream.split();
+
+        // Subscribe to assets
+        let subscribe_msg = SubscribeMessage {
+            msg_type: "MARKET".to_string(),
+            assets_ids: asset_ids.clone(),
+        };
+
+        let msg_json = serde_json::to_string(&subscribe_msg)
+            .map_err(|e| WsError::SendFailed(e.to_string()))?;
+
+        write
+            .send(Message::Text(msg_json))
+            .await
+            .map_err(|e| WsError::SendFailed(e.to_string()))?;
+
+        info!("Subscribed to {} assets", asset_ids.len());
+
+        // Process messages
+        let books = &self.books;
+        let stream = read.filter_map(move |msg| {
+            let books = books;
+            async move {
+                match msg {
+                    Ok(Message::Text(text)) => {
+                        Self::process_message(books, &text)
+                    }
+                    Ok(Message::Ping(_)) => {
+                        debug!("Received ping");
+                        None
+                    }
+                    Ok(Message::Pong(_)) => None,
+                    Ok(Message::Close(frame)) => {
+                        warn!(frame = ?frame, "WebSocket closed");
+                        None
+                    }
+                    Ok(_) => None,
+                    Err(e) => {
+                        error!(error = %e, "WebSocket error");
+                        None
+                    }
+                }
+            }
+        });
+
+        Ok(stream)
+    }
+
+    /// Process a WebSocket message.
+    fn process_message(
+        books: &DashMap<String, L2BookState>,
+        text: &str,
+    ) -> Option<BookUpdate> {
+        // Messages can be single objects or arrays
+        let events: Vec<WsEvent> = if text.starts_with('[') {
+            serde_json::from_str(text).ok()?
+        } else {
+            vec![serde_json::from_str(text).ok()?]
+        };
+
+        let mut last_update: Option<BookUpdate> = None;
+
+        for event in events {
+            let event_type = event.event_type.as_deref()?;
+
+            match event_type {
+                "book" => {
+                    let asset_id = event.asset_id.as_ref()?;
+                    if let Some(mut book) = books.get_mut(asset_id) {
+                        book.apply_snapshot(
+                            event.bids.unwrap_or_default(),
+                            event.asks.unwrap_or_default(),
+                        );
+                        book.last_timestamp_ms = event.timestamp;
+                        book.last_hash = event.hash.clone();
+                    }
+                    last_update = Some(BookUpdate {
+                        asset_id: asset_id.clone(),
+                        event_type: WsEventType::Book,
+                    });
+                }
+                "price_change" => {
+                    if let Some(changes) = &event.price_changes {
+                        for change in changes {
+                            if let Some(asset_id) = &change.asset_id {
+                                if let Some(mut book) = books.get_mut(asset_id) {
+                                    book.apply_delta(change);
+                                    book.last_timestamp_ms = event.timestamp;
+                                }
+                                last_update = Some(BookUpdate {
+                                    asset_id: asset_id.clone(),
+                                    event_type: WsEventType::PriceChange,
+                                });
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        last_update
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn l2_book_state_apply_snapshot() {
+        let mut state = L2BookState::default();
+        state.apply_snapshot(
+            vec![
+                WsLevel { price: "0.48".to_string(), size: "100".to_string() },
+                WsLevel { price: "0.47".to_string(), size: "50".to_string() },
+            ],
+            vec![
+                WsLevel { price: "0.50".to_string(), size: "100".to_string() },
+            ],
+        );
+
+        assert_eq!(state.bids.len(), 2);
+        assert_eq!(state.asks.len(), 1);
+        assert_eq!(state.bids.get(&dec!(0.48)), Some(&dec!(100)));
+    }
+
+    #[test]
+    fn l2_book_state_apply_delta() {
+        let mut state = L2BookState::default();
+        state.bids.insert(dec!(0.48), dec!(100));
+
+        // Update existing level
+        state.apply_delta(&WsPriceChange {
+            asset_id: None,
+            price: "0.48".to_string(),
+            size: "150".to_string(),
+            side: "BUY".to_string(),
+            hash: None,
+        });
+        assert_eq!(state.bids.get(&dec!(0.48)), Some(&dec!(150)));
+
+        // Remove level
+        state.apply_delta(&WsPriceChange {
+            asset_id: None,
+            price: "0.48".to_string(),
+            size: "0".to_string(),
+            side: "BUY".to_string(),
+            hash: None,
+        });
+        assert!(!state.bids.contains_key(&dec!(0.48)));
+    }
+
+    #[test]
+    fn l2_book_state_to_levels_sorted() {
+        let mut state = L2BookState::default();
+        state.bids.insert(dec!(0.47), dec!(50));
+        state.bids.insert(dec!(0.48), dec!(100));
+        state.asks.insert(dec!(0.51), dec!(100));
+        state.asks.insert(dec!(0.50), dec!(50));
+
+        let (bids, asks) = state.to_levels();
+
+        assert_eq!(bids[0].price, dec!(0.48)); // Highest first
+        assert_eq!(bids[1].price, dec!(0.47));
+        assert_eq!(asks[0].price, dec!(0.50)); // Lowest first
+        assert_eq!(asks[1].price, dec!(0.51));
+    }
+}

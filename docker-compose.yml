@@ -1,0 +1,77 @@
+version: '3.8'
+
+services:
+  polymarket-arb:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: polymarket-arb-bot
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # Required credentials (set in .env file or environment)
+      - POLYMARKET_PRIVATE_KEY=${POLYMARKET_PRIVATE_KEY}
+      - POLYMARKET_API_KEY=${POLYMARKET_API_KEY:-}
+      - POLYMARKET_API_SECRET=${POLYMARKET_API_SECRET:-}
+      - POLYMARKET_API_PASSPHRASE=${POLYMARKET_API_PASSPHRASE:-}
+
+      # Wallet configuration
+      - POLYMARKET_SIGNATURE_TYPE=${POLYMARKET_SIGNATURE_TYPE:-0}
+      - POLYMARKET_FUNDER=${POLYMARKET_FUNDER:-}
+
+      # Trading parameters
+      - TARGET_PAIR_COST=${TARGET_PAIR_COST:-0.991}
+      - ORDER_SIZE=${ORDER_SIZE:-5}
+      - ORDER_TYPE=${ORDER_TYPE:-FOK}
+      - BALANCE_MARGIN=${BALANCE_MARGIN:-1.2}
+
+      # Operation modes
+      - DRY_RUN=${DRY_RUN:-true}
+      - SIM_BALANCE=${SIM_BALANCE:-100}
+      - COOLDOWN_SECONDS=${COOLDOWN_SECONDS:-10}
+
+      # Market discovery
+      - POLYMARKET_MARKET_SLUG=${POLYMARKET_MARKET_SLUG:-}
+
+      # WebSocket configuration
+      - USE_WSS=${USE_WSS:-false}
+      - POLYMARKET_WS_URL=${POLYMARKET_WS_URL:-wss://ws-subscriptions-clob.polymarket.com}
+      - POLYMARKET_CLOB_URL=${POLYMARKET_CLOB_URL:-https://clob.polymarket.com}
+
+      # Logging
+      - RUST_LOG=${RUST_LOG:-info}
+      - VERBOSE=${VERBOSE:-false}
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Optional: Prometheus for metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: polymarket-prometheus
+    profiles:
+      - monitoring
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    depends_on:
+      - polymarket-arb
+
+volumes:
+  prometheus-data:
